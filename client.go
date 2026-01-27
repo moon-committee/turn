@@ -6,6 +6,7 @@ package turn
 import (
 	"context"
 	b64 "encoding/base64"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -24,6 +25,10 @@ const (
 	defaultRTO        = 200 * time.Millisecond
 	maxRtxCount       = 7              // Total 7 requests (Rc)
 	maxDataBufferSize = math.MaxUint16 // Message size limit for Chromium
+	// while there is no limit in the RFC (RFC 5389/8489),
+	// this caps how many consecutive ALTERNATE-SERVER redirects
+	// we have a generous limit of 64 to prevent infinite loops and abuse.
+	maxAltSrvRedirects = 64
 )
 
 //              interval [msec]
@@ -68,7 +73,7 @@ type Client struct {
 	conn           net.PacketConn // Read-only
 	net            transport.Net  // Read-only
 	stunServerAddr net.Addr       // Read-only
-	turnServerAddr net.Addr       // Read-only
+	turnServerAddr net.Addr
 
 	username      stun.Username          // Read-only
 	password      string                 // Read-only
@@ -97,6 +102,19 @@ type Client struct {
 	permissionRefreshInterval time.Duration
 	bindingRefreshInterval    time.Duration
 	bindingCheckInterval      time.Duration
+}
+
+type errAlternateServerError struct {
+	code      stun.ErrorCodeAttribute
+	alternate *net.UDPAddr
+}
+
+func (e *errAlternateServerError) Error() string {
+	if e.alternate != nil {
+		return fmt.Sprintf("turn: %s (alternate %s)", e.code.String(), e.alternate.String())
+	}
+
+	return fmt.Sprintf("turn: %s (alternate server missing)", e.code.String())
 }
 
 // inferAddressFamilyFromConn attempts to determine the address
@@ -358,7 +376,80 @@ func (c *Client) SendBindingRequest() (net.Addr, error) {
 	return c.SendBindingRequestTo(c.stunServerAddr)
 }
 
-func (c *Client) sendAllocateRequest(protocol proto.Protocol, ctx context.Context) ( //nolint:cyclop
+func parseAlternateServer(msg *stun.Message) (*net.UDPAddr, error) {
+	var alt stun.AlternateServer
+	if err := alt.GetFrom(msg); err != nil {
+		return nil, err
+	}
+
+	return &net.UDPAddr{
+		IP:   alt.IP,
+		Port: alt.Port,
+	}, nil
+}
+
+// handleAllocateError classifies Allocate error responses.
+// If allowAuthRetry is true, 401/438 are treated as continuable (so caller can
+// extract nonce/realm). Otherwise they are returned as errors.
+// Returns proceed=true when the caller should continue.
+// Returns an error when the caller should stop (redirect or terminal error).
+func handleAllocateError(res *stun.Message, allowAuthRetry bool, allowAlternate bool) (proceed bool, err error) {
+	if res.Type.Class != stun.ClassErrorResponse {
+		return true, nil
+	}
+
+	var code stun.ErrorCodeAttribute
+	if err = code.GetFrom(res); err != nil {
+		return false, err
+	}
+
+	switch code.Code {
+	case stun.CodeTryAlternate:
+		if !allowAlternate {
+			return false, &stun.TurnError{StunMessageType: res.Type, ErrorCodeAttr: code}
+		}
+
+		if alt, altErr := parseAlternateServer(res); altErr == nil {
+			return false, &errAlternateServerError{code: code, alternate: alt}
+		}
+
+		return false, &errAlternateServerError{code: code}
+	case stun.CodeUnauthorized, stun.CodeStaleNonce:
+		if allowAuthRetry {
+			// Continue so nonce/realm can be extracted.
+			return true, nil
+		}
+
+		return false, &stun.TurnError{StunMessageType: res.Type, ErrorCodeAttr: code}
+	default:
+		return false, &stun.TurnError{StunMessageType: res.Type, ErrorCodeAttr: code}
+	}
+}
+
+// parseAuthResponse processes an unauthenticated Allocate error response,
+// returning nonce and realm when the flow should continue with auth.
+func parseAuthResponse(res *stun.Message, allowAlternate bool) (stun.Nonce, stun.Realm, error) {
+	var nonce stun.Nonce
+	var realm stun.Realm
+
+	if proceed, err := handleAllocateError(res, true, allowAlternate); err != nil || !proceed {
+		return nonce, realm, err
+	}
+
+	if err := nonce.GetFrom(res); err != nil {
+		return nonce, realm, err
+	}
+	if err := realm.GetFrom(res); err != nil {
+		return nonce, realm, err
+	}
+
+	// Copy realm to detach from the STUN message buffer.
+	realm = append([]byte(nil), realm...)
+
+	return nonce, realm, nil
+}
+
+func (c *Client) sendAllocateRequest(protocol proto.Protocol, turnAddr net.Addr, allowAlternate bool, ctx context.Context) ( //nolint:cyclop
 	relayed proto.RelayedAddress,
 	lifetime proto.Lifetime,
 	nonce stun.Nonce,
@@ -386,21 +477,16 @@ func (c *Client) sendAllocateRequest(protocol proto.Protocol, ctx context.Contex
 		return relayed, lifetime, nonce, reservationToken, err
 	}
 
-	trRes, err := c.PerformTransactionWithContext(msg, c.turnServerAddr, false, ctx)
+	trRes, err := c.PerformTransaction(msg, turnAddr, false)
 	if err != nil {
 		return relayed, lifetime, nonce, reservationToken, err
 	}
 
 	res := trRes.Msg
 
-	// Anonymous allocate failed, trying to authenticate.
-	if err = nonce.GetFrom(res); err != nil {
+	if nonce, c.realm, err = parseAuthResponse(res, allowAlternate); err != nil {
 		return relayed, lifetime, nonce, reservationToken, err
 	}
-	if err = c.realm.GetFrom(res); err != nil {
-		return relayed, lifetime, nonce, reservationToken, err
-	}
-	c.realm = append([]byte(nil), c.realm...)
 	c.integrity = stun.NewLongTermIntegrity(
 		c.username.String(), c.realm.String(), c.password,
 	)
@@ -434,24 +520,14 @@ func (c *Client) sendAllocateRequest(protocol proto.Protocol, ctx context.Contex
 		return relayed, lifetime, nonce, reservationToken, err
 	}
 
-	trRes, err = c.PerformTransactionWithContext(msg, c.turnServerAddr, false, ctx)
+	trRes, err = c.PerformTransactionWithContext(msg, turnAddr, false, ctx)
 	if err != nil {
 		return relayed, lifetime, nonce, reservationToken, err
 	}
 	res = trRes.Msg
 
-	if res.Type.Class == stun.ClassErrorResponse {
-		var code stun.ErrorCodeAttribute
-		if err = code.GetFrom(res); err == nil {
-			turnError := &stun.TurnError{
-				StunMessageType: res.Type,
-				ErrorCodeAttr:   code,
-			}
-
-			return relayed, lifetime, nonce, reservationToken, turnError
-		}
-
-		return relayed, lifetime, nonce, reservationToken, fmt.Errorf("%s", res.Type) //nolint:err113
+	if proceed, err := handleAllocateError(res, false, allowAlternate); err != nil || !proceed {
+		return relayed, lifetime, nonce, reservationToken, err
 	}
 
 	// Getting relayed addresses from response.
@@ -474,6 +550,49 @@ func (c *Client) sendAllocateRequest(protocol proto.Protocol, ctx context.Contex
 	return relayed, lifetime, nonce, reservationToken, nil
 }
 
+// sendAllocateWithRedirect wraps sendAllocateRequest and follows TURN
+// ALTERNATE-SERVER (error code 300).
+func (c *Client) sendAllocateWithRedirect(protocol proto.Protocol, ctx context.Context) ( //nolint:cyclop
+	relayed proto.RelayedAddress,
+	lifetime proto.Lifetime,
+	nonce stun.Nonce,
+	reservationToken proto.ReservationToken,
+	serverAddr net.Addr,
+	err error,
+) {
+	currentTurn := c.turnServerAddr
+	redirects := 0
+	visited := map[string]struct{}{}
+
+	for {
+		relayed, lifetime, nonce, reservationToken, err = c.sendAllocateRequest(protocol, currentTurn, true, ctx)
+		if err == nil {
+			return relayed, lifetime, nonce, reservationToken, currentTurn, nil
+		}
+
+		var altErr *errAlternateServerError
+		if errors.As(err, &altErr) && altErr.alternate != nil {
+			redirects++
+			if redirects > maxAltSrvRedirects {
+				return relayed, lifetime, nonce, reservationToken, currentTurn, errAlternateServerRedirects
+			}
+
+			key := altErr.alternate.String()
+			if _, ok := visited[key]; ok {
+				return relayed, lifetime, nonce, reservationToken, currentTurn, errAlternateServerLoop
+			}
+
+			visited[key] = struct{}{}
+
+			currentTurn = altErr.alternate
+
+			continue
+		}
+
+		return relayed, lifetime, nonce, reservationToken, currentTurn, err
+	}
+}
+
 // AllocateWithContext sends a TURN allocation request to the given transport address.
 // The context controls the lifetime of the allocation request and its response.
 func (c *Client) AllocateWithContext(ctx context.Context) (net.PacketConn, error) {
@@ -487,7 +606,7 @@ func (c *Client) AllocateWithContext(ctx context.Context) (net.PacketConn, error
 		return nil, fmt.Errorf("%w: %s", errAlreadyAllocated, relayedConn.LocalAddr().String())
 	}
 
-	relayed, lifetime, nonce, reservationToken, err := c.sendAllocateRequest(proto.ProtoUDP, ctx)
+	relayed, lifetime, nonce, reservationToken, serverAddr, err := c.sendAllocateWithRedirect(proto.ProtoUDP, ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -501,7 +620,7 @@ func (c *Client) AllocateWithContext(ctx context.Context) (net.PacketConn, error
 	relayedConn = client.NewUDPConn(&client.AllocationConfig{
 		Client:                    c,
 		RelayedAddr:               relayedAddr,
-		ServerAddr:                c.turnServerAddr,
+		ServerAddr:                serverAddr,
 		Realm:                     c.realm,
 		Username:                  c.username,
 		Integrity:                 c.integrity,
@@ -537,7 +656,7 @@ func (c *Client) AllocateTCPWithContext(ctx context.Context) (*client.TCPAllocat
 		return nil, fmt.Errorf("%w: %s", errAlreadyAllocated, allocation.Addr())
 	}
 
-	relayed, lifetime, nonce, reservationToken, err := c.sendAllocateRequest(proto.ProtoTCP, ctx)
+	relayed, lifetime, nonce, reservationToken, err := c.sendAllocateRequest(proto.ProtoTCP, c.turnServerAddr, false, ctx)
 	if err != nil {
 		return nil, err
 	}
