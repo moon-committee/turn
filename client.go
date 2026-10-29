@@ -73,7 +73,7 @@ type Client struct {
 	conn           net.PacketConn // Read-only
 	net            transport.Net  // Read-only
 	stunServerAddr net.Addr       // Read-only
-	turnServerAddr net.Addr
+	turnServerAddr net.Addr       // Protected by mutex ***
 
 	username      stun.Username          // Read-only
 	password      string                 // Read-only
@@ -273,8 +273,12 @@ func NewClient(config *ClientConfig) (*Client, error) { //nolint:gocyclo,cyclop
 	return client, nil
 }
 
-// TURNServerAddr return the TURN server address.
+// TURNServerAddr return the TURN server address. After an allocation follows
+// an ALTERNATE-SERVER redirect, this is the server that served the allocation.
 func (c *Client) TURNServerAddr() net.Addr {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
 	return c.turnServerAddr
 }
 
@@ -560,7 +564,10 @@ func (c *Client) sendAllocateWithRedirect(protocol proto.Protocol, ctx context.C
 	serverAddr net.Addr,
 	err error,
 ) {
+	c.mutex.RLock()
 	currentTurn := c.turnServerAddr
+	c.mutex.RUnlock()
+
 	redirects := 0
 	visited := map[string]struct{}{}
 
@@ -610,6 +617,13 @@ func (c *Client) AllocateWithContext(ctx context.Context) (net.PacketConn, error
 	if err != nil {
 		return nil, err
 	}
+
+	// Follow-up transactions are addressed to the allocation's server, and
+	// relayed traffic arrives from it. Track the redirect target so
+	// handleInbound accepts that traffic instead of treating it as spoofed.
+	c.mutex.Lock()
+	c.turnServerAddr = serverAddr
+	c.mutex.Unlock()
 
 	relayedAddr := &net.UDPAddr{
 		IP:   relayed.IP,
@@ -835,12 +849,19 @@ func (c *Client) HandleInbound(data []byte, from net.Addr) (bool, error) {
 }
 
 func (c *Client) isTURNServer(from net.Addr) bool {
-	server := c.turnServerAddr
+	if from == nil {
+		return false
+	}
 	if conn, ok := c.conn.(interface{ RemoteAddr() net.Addr }); ok && conn.RemoteAddr() != nil {
-		server = conn.RemoteAddr()
+		// A connected transport only accepts relay traffic from its peer.
+		return from.String() == conn.RemoteAddr().String()
 	}
 
-	return from != nil && server != nil && from.String() == server.String()
+	c.mutex.RLock()
+	server := c.turnServerAddr
+	c.mutex.RUnlock()
+
+	return server != nil && from.String() == server.String()
 }
 
 func (c *Client) handleSTUNMessage(data []byte, from net.Addr) error { //nolint:cyclop

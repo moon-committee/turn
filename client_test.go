@@ -514,13 +514,156 @@ func TestClientAllocateFollowsAlternateServer(t *testing.T) {
 	allocation, err := client.Allocate()
 	require.NoError(t, err)
 	require.NotNil(t, allocation)
-	require.Equal(t, origServer, client.TURNServerAddr().String())
+	// The client now serves the allocation from the redirect target, which is
+	// also where relayed traffic must be accepted from.
+	assert.Equal(t, altListener.LocalAddr().String(), client.TURNServerAddr().String())
+	assert.NotEqual(t, origServer, client.TURNServerAddr().String())
 
 	require.NoError(t, client.CreatePermission(&net.UDPAddr{
 		IP:   net.ParseIP("127.0.0.1"),
 		Port: 30000,
 	}))
 
+	assert.NoError(t, allocation.Close())
+	assert.NoError(t, clientConn.Close())
+	assert.NoError(t, redirectListener.Close())
+	assert.NoError(t, altServer.Close())
+	<-redirectDone
+}
+
+func TestClientAlternateServerRelayData(t *testing.T) {
+	loggerFactory := logging.NewDefaultLoggerFactory()
+
+	altListener, err := net.ListenPacket("udp4", "127.0.0.1:0") // nolint: noctx
+	require.NoError(t, err)
+
+	altServer, err := NewServer(ServerConfig{
+		AuthHandler: func(ra *RequestAttributes) (userID string, key []byte, ok bool) {
+			return ra.Username, GenerateAuthKey(ra.Username, ra.Realm, "pass"), true
+		},
+		PacketConnConfigs: []PacketConnConfig{
+			{
+				PacketConn: altListener,
+				RelayAddressGenerator: &RelayAddressGeneratorStatic{
+					RelayAddress: net.ParseIP("127.0.0.1"),
+					Address:      "0.0.0.0",
+				},
+			},
+		},
+		Realm: "pion.ly",
+	})
+	require.NoError(t, err)
+
+	redirectListener, err := net.ListenPacket("udp4", "127.0.0.1:0") // nolint: noctx
+	require.NoError(t, err)
+
+	redirectDone := make(chan struct{})
+	go func() { //nolint:dupl
+		defer close(redirectDone)
+		buf := make([]byte, 1500)
+		for {
+			n, from, readErr := redirectListener.ReadFrom(buf)
+			if readErr != nil {
+				return
+			}
+
+			var req stun.Message
+			req.Raw = append(req.Raw[:0], buf[:n]...)
+			if decodeErr := req.Decode(); decodeErr != nil {
+				continue
+			}
+
+			altAddr, ok := altListener.LocalAddr().(*net.UDPAddr)
+			assert.True(t, ok)
+			resp, buildErr := stun.Build(
+				&stun.Message{TransactionID: req.TransactionID},
+				stun.NewType(stun.MethodAllocate, stun.ClassErrorResponse),
+				stun.ErrorCodeAttribute{Code: stun.CodeTryAlternate, Reason: []byte("Try Alternate")},
+				&stun.AlternateServer{IP: altAddr.IP, Port: altAddr.Port},
+				stun.Fingerprint,
+			)
+			if buildErr != nil {
+				continue
+			}
+
+			_, _ = redirectListener.WriteTo(resp.Raw, from)
+		}
+	}()
+
+	clientConn, err := net.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+	require.NoError(t, err)
+
+	redirectAddr := redirectListener.LocalAddr().String()
+	altAddr := altListener.LocalAddr().String()
+
+	client, err := NewClient(&ClientConfig{
+		Conn:           clientConn,
+		STUNServerAddr: redirectAddr,
+		TURNServerAddr: redirectAddr,
+		Username:       "foo",
+		Password:       "pass",
+		Realm:          "pion.ly",
+		LoggerFactory:  loggerFactory,
+	})
+	require.NoError(t, err)
+	require.NoError(t, client.Listen())
+
+	allocation, err := client.Allocate()
+	require.NoError(t, err)
+	require.NotNil(t, allocation)
+
+	// A peer allocated directly on the alternate server must be able to send
+	// relayed data to the redirected client. Before the redirect target was
+	// tracked as the client's TURN server, inbound packets from it were
+	// discarded as coming from an unknown source.
+	peerConn, err := net.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+	require.NoError(t, err)
+
+	peer, err := NewClient(&ClientConfig{
+		Conn:           peerConn,
+		STUNServerAddr: altAddr,
+		TURNServerAddr: altAddr,
+		Username:       "foo",
+		Password:       "pass",
+		Realm:          "pion.ly",
+		LoggerFactory:  loggerFactory,
+	})
+	require.NoError(t, err)
+	require.NoError(t, peer.Listen())
+
+	peerAllocation, err := peer.Allocate()
+	require.NoError(t, err)
+	require.NotNil(t, peerAllocation)
+
+	// The peer has no permission for the redirected client yet, so this packet
+	// primes the permission and is dropped by the client's relay.
+	_, err = peerAllocation.WriteTo([]byte("prime"), allocation.LocalAddr())
+	require.NoError(t, err)
+
+	// This creates the client's permission for the peer and delivers data.
+	_, err = allocation.WriteTo([]byte("hello-peer"), peerAllocation.LocalAddr())
+	require.NoError(t, err)
+
+	peerBuf := make([]byte, 64)
+	require.NoError(t, peerAllocation.SetReadDeadline(time.Now().Add(5*time.Second)))
+	n, _, err := peerAllocation.ReadFrom(peerBuf)
+	require.NoError(t, err)
+	require.Equal(t, "hello-peer", string(peerBuf[:n]))
+
+	// Now the client's permission exists, so relayed data from the peer must be
+	// delivered even though it arrives from the alternate server.
+	_, err = peerAllocation.WriteTo([]byte("hello-client"), allocation.LocalAddr())
+	require.NoError(t, err)
+
+	buf := make([]byte, 64)
+	require.NoError(t, allocation.SetReadDeadline(time.Now().Add(5*time.Second)))
+	n, _, err = allocation.ReadFrom(buf)
+	require.NoError(t, err)
+	require.Equal(t, "hello-client", string(buf[:n]))
+
+	assert.NoError(t, peerAllocation.Close())
+	peer.Close()
+	assert.NoError(t, peerConn.Close())
 	assert.NoError(t, allocation.Close())
 	assert.NoError(t, clientConn.Close())
 	assert.NoError(t, redirectListener.Close())
